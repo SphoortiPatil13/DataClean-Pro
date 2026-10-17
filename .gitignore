@@ -1,0 +1,23 @@
+# Local environment settings and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+build/
+
+# Uploaded or private data
+uploads/
+private/
