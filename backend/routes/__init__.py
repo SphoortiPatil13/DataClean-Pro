@@ -327,11 +327,14 @@ def clean_csv():
     if uploaded_file is None:
         return jsonify(status="error", message="Please provide a CSV file"), 400
 
-    filename = secure_filename(uploaded_file.filename or "")
+    original_filename = uploaded_file.filename or ""
+    filename = secure_filename(original_filename)
     if not filename:
         return jsonify(status="error", message="Please choose a valid file"), 400
     if not filename.lower().endswith(".csv"):
         return jsonify(status="error", message="Only CSV files are accepted"), 400
+    if len(original_filename) > 255:
+        return jsonify(status="error", message="The CSV filename is too long"), 400
     uploaded_file.stream.seek(0, 2)
     uploaded_size = uploaded_file.stream.tell()
     uploaded_file.stream.seek(0)
@@ -385,12 +388,134 @@ def clean_csv():
     )
 
     preview = json.loads(dataframe.head(10).to_json(orient="records", date_format="iso"))
+    cleaned_csv = dataframe.to_csv(index=False)
+    operations = []
+    if boolean_options["remove_duplicates"]:
+        operations.append("Remove duplicate rows")
+    if boolean_options["remove_empty_rows"]:
+        operations.append("Remove completely empty rows")
+    if boolean_options["trim_whitespace"]:
+        operations.append("Trim leading and trailing whitespace")
+    if boolean_options["handle_missing"]:
+        if missing_strategy == "remove":
+            operations.append("Remove rows with missing values")
+        else:
+            operations.append(f"Fill missing values with {missing_placeholder}")
+
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO cleaning_history (
+                    user_id, original_filename, operations,
+                    original_row_count, final_row_count
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    g.authenticated_user["id"],
+                    original_filename,
+                    json.dumps(operations),
+                    original_row_count,
+                    len(dataframe),
+                ),
+            )
+            history_id = cursor.lastrowid
+        connection.commit()
+    except (pymysql.MySQLError, OSError) as error:
+        if connection is not None:
+            connection.rollback()
+        if isinstance(error, pymysql.MySQLError):
+            error_code = error.args[0] if error.args and isinstance(error.args[0], int) else "unknown"
+            sqlstate = getattr(error, "sqlstate", None) or "unknown"
+            current_app.logger.error(
+                "Could not save CSV cleaning history "
+                "(database error type=%s, code=%s, SQLSTATE=%s)",
+                type(error).__name__,
+                error_code,
+                sqlstate,
+            )
+        else:
+            current_app.logger.error(
+                "Could not save CSV cleaning history (error type=%s)",
+                type(error).__name__,
+            )
+        return jsonify(
+            status="error",
+            message="The CSV was cleaned, but its history could not be saved. Please try again.",
+        ), 503
+    finally:
+        if connection is not None:
+            connection.close()
+
     return jsonify(
         status="success",
+        history_id=history_id,
         columns=[str(column) for column in dataframe.columns],
         original_row_count=original_row_count,
         row_count=len(dataframe),
         preview=preview,
-        cleaned_csv=dataframe.to_csv(index=False),
+        cleaned_csv=cleaned_csv,
         unfilled_columns=unfilled_columns,
     ), 200
+
+
+@api_bp.get("/cleaning-history")
+@login_required
+def get_cleaning_history():
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, original_filename, operations,
+                       original_row_count, final_row_count, created_at
+                FROM cleaning_history
+                WHERE user_id = %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (g.authenticated_user["id"],),
+            )
+            rows = cursor.fetchall()
+    except (pymysql.MySQLError, OSError):
+        current_app.logger.exception("Could not retrieve CSV cleaning history")
+        return jsonify(
+            status="error",
+            message="Cleaning history is temporarily unavailable. Please try again later.",
+        ), 503
+    finally:
+        if connection is not None:
+            connection.close()
+
+    history = []
+    try:
+        for row in rows:
+            operations = row[2]
+            if isinstance(operations, str):
+                operations = json.loads(operations)
+            if (
+                not isinstance(operations, list)
+                or any(not isinstance(operation, str) or len(operation) > 300 for operation in operations)
+            ):
+                raise ValueError("Invalid cleaning history operations")
+
+            created_at = row[5]
+            history.append({
+                "id": row[0],
+                "filename": row[1],
+                "operations": operations,
+                "original_row_count": row[3],
+                "final_row_count": row[4],
+                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            })
+    except (TypeError, ValueError, json.JSONDecodeError):
+        current_app.logger.exception("Cleaning history contains invalid stored data")
+        return jsonify(
+            status="error",
+            message="Cleaning history is temporarily unavailable. Please try again later.",
+        ), 503
+
+    return jsonify(status="success", history=history), 200

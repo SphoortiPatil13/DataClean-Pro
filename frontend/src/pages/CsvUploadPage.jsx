@@ -4,7 +4,7 @@ const API_URL = '/api/upload'
 const CLEAN_API_URL = '/api/clean'
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024
 
-function CsvUploadPage({ onSessionExpired }) {
+function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
   const [file, setFile] = useState(null)
   const [result, setResult] = useState(null)
   const [cleanResult, setCleanResult] = useState(null)
@@ -136,6 +136,7 @@ function CsvUploadPage({ onSessionExpired }) {
     }
 
     setCleanResult(payload)
+    onCleaningComplete?.()
     setIsCleaning(false)
   }
 

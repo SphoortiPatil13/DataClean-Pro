@@ -677,6 +677,38 @@
   box-shadow: 0 14px 38px rgba(32, 51, 40, 0.08);
 }
 
+.history-card {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 auto;
+  padding: clamp(24px, 5vw, 38px);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 14px 38px rgba(32, 51, 40, 0.08);
+}
+
+.history-card h2 {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: 24px;
+  font-weight: 650;
+}
+
+.history-table-scroll {
+  overflow-x: auto;
+  margin-top: 18px;
+}
+
+.history-table {
+  width: 100%;
+  min-width: 680px;
+}
+
+.history-table td {
+  overflow-wrap: anywhere;
+}
+
 .upload-card h1,
 .upload-card h2 {
   margin: 0;
