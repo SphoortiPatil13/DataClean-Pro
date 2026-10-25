@@ -41,6 +41,15 @@ def read_csv_for_cleaning(stream):
     )
 
 
+def get_data_quality_stats(dataframe):
+    return {
+        "total_rows": len(dataframe),
+        "missing_values": int(dataframe.isna().sum().sum()),
+        "duplicate_rows": int(dataframe.duplicated().sum()),
+        "empty_rows": int(dataframe.isna().all(axis=1).sum()),
+    }
+
+
 def clean_dataframe(
     dataframe,
     *,

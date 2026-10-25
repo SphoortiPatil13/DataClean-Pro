@@ -27,9 +27,11 @@ CREATE TABLE IF NOT EXISTS cleaning_history (
     operations JSON NOT NULL,
     original_row_count INT UNSIGNED NOT NULL,
     final_row_count INT UNSIGNED NOT NULL,
+    cleaned_file_id CHAR(32) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     INDEX idx_cleaning_history_user_created (user_id, created_at, id),
+    UNIQUE INDEX uq_cleaning_history_cleaned_file_id (cleaned_file_id),
     CONSTRAINT fk_cleaning_history_user
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );

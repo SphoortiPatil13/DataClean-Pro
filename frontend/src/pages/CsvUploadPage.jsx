@@ -294,6 +294,51 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
             {' · '}
             Rows after: <strong>{cleanResult.row_count}</strong>
           </p>
+          {cleanResult.quality_report && (
+            <section className="quality-report" aria-labelledby="quality-report-title">
+              <h3 id="quality-report-title">Data Quality Report</h3>
+              <p className="example-note">
+                Missing values count cells; duplicate rows count repeats after the first occurrence;
+                empty rows contain only missing values.
+              </p>
+              <div className="table-scroll quality-report-scroll">
+                <table className="data-table quality-report-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Measure</th>
+                      <th scope="col">Before cleaning</th>
+                      <th scope="col">After cleaning</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th scope="row">Total rows</th>
+                      <td>{cleanResult.quality_report.before.total_rows}</td>
+                      <td>{cleanResult.quality_report.after.total_rows}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Missing values</th>
+                      <td>{cleanResult.quality_report.before.missing_values}</td>
+                      <td>{cleanResult.quality_report.after.missing_values}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Duplicate rows</th>
+                      <td>{cleanResult.quality_report.before.duplicate_rows}</td>
+                      <td>{cleanResult.quality_report.after.duplicate_rows}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Completely empty rows</th>
+                      <td>{cleanResult.quality_report.before.empty_rows}</td>
+                      <td>{cleanResult.quality_report.after.empty_rows}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p className="quality-rows-removed">
+                Rows removed: <strong>{cleanResult.quality_report.rows_removed}</strong>
+              </p>
+            </section>
+          )}
           {cleanResult.unfilled_columns?.length > 0 && (
             <p className="example-note" role="status">
               Could not fill automatically because no suitable value was available for: {cleanResult.unfilled_columns.join(', ')}.

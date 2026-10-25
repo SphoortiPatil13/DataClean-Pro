@@ -3,9 +3,10 @@ import hashlib
 import hmac
 import re
 import secrets
+import uuid
 from functools import wraps
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, request, send_file
 import pymysql
 import pandas as pd
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -16,9 +17,15 @@ from config import MAX_UPLOAD_SIZE
 from services.csv_cleaning import (
     MISSING_PLACEHOLDERS,
     clean_dataframe,
+    get_data_quality_stats,
     read_csv_for_cleaning,
 )
 from services.database import get_db_connection
+from services.cleaned_file_storage import (
+    delete_cleaned_csv,
+    get_cleaned_csv_path,
+    save_cleaned_csv,
+)
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 DUMMY_PASSWORD_HASH = generate_password_hash("datacleanpro-nonexistent-account")
@@ -376,7 +383,9 @@ def clean_csv():
     except ValueError:
         return jsonify(status="error", message="The CSV file is malformed or could not be parsed"), 400
 
-    original_row_count = len(dataframe)
+    original_dataframe = dataframe
+    original_row_count = len(original_dataframe)
+    quality_before = get_data_quality_stats(original_dataframe)
     dataframe, unfilled_columns = clean_dataframe(
         dataframe,
         remove_empty_rows=boolean_options["remove_empty_rows"],
@@ -386,6 +395,7 @@ def clean_csv():
         missing_strategy=missing_strategy,
         missing_placeholder=missing_placeholder,
     )
+    quality_after = get_data_quality_stats(dataframe)
 
     preview = json.loads(dataframe.head(10).to_json(orient="records", date_format="iso"))
     cleaned_csv = dataframe.to_csv(index=False)
@@ -402,6 +412,16 @@ def clean_csv():
         else:
             operations.append(f"Fill missing values with {missing_placeholder}")
 
+    cleaned_file_id = uuid.uuid4().hex
+    try:
+        save_cleaned_csv(cleaned_file_id, cleaned_csv)
+    except OSError:
+        current_app.logger.exception("Could not persist cleaned CSV output")
+        return jsonify(
+            status="error",
+            message="The CSV was cleaned, but its download could not be made available. Please try again.",
+        ), 503
+
     connection = None
     try:
         connection = get_db_connection()
@@ -410,9 +430,9 @@ def clean_csv():
                 """
                 INSERT INTO cleaning_history (
                     user_id, original_filename, operations,
-                    original_row_count, final_row_count
+                    original_row_count, final_row_count, cleaned_file_id
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     g.authenticated_user["id"],
@@ -420,6 +440,7 @@ def clean_csv():
                     json.dumps(operations),
                     original_row_count,
                     len(dataframe),
+                    cleaned_file_id,
                 ),
             )
             history_id = cursor.lastrowid
@@ -427,6 +448,10 @@ def clean_csv():
     except (pymysql.MySQLError, OSError) as error:
         if connection is not None:
             connection.rollback()
+        try:
+            delete_cleaned_csv(cleaned_file_id)
+        except OSError:
+            current_app.logger.exception("Could not remove unreferenced cleaned CSV output")
         if isinstance(error, pymysql.MySQLError):
             error_code = error.args[0] if error.args and isinstance(error.args[0], int) else "unknown"
             sqlstate = getattr(error, "sqlstate", None) or "unknown"
@@ -456,9 +481,137 @@ def clean_csv():
         columns=[str(column) for column in dataframe.columns],
         original_row_count=original_row_count,
         row_count=len(dataframe),
+        quality_report={
+            "before": quality_before,
+            "after": quality_after,
+            "rows_removed": original_row_count - len(dataframe),
+        },
         preview=preview,
         cleaned_csv=cleaned_csv,
         unfilled_columns=unfilled_columns,
+    ), 200
+
+
+@api_bp.get("/cleaning-history/<int:history_id>/download")
+@login_required
+def download_cleaned_csv(history_id):
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT original_filename, cleaned_file_id
+                FROM cleaning_history
+                WHERE id = %s AND user_id = %s
+                LIMIT 1
+                """,
+                (history_id, g.authenticated_user["id"]),
+            )
+            history_record = cursor.fetchone()
+    except (pymysql.MySQLError, OSError):
+        current_app.logger.exception("Could not retrieve cleaned CSV history record")
+        return jsonify(
+            status="error",
+            message="The cleaned CSV is temporarily unavailable. Please try again later.",
+        ), 503
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if history_record is None or history_record[1] is None:
+        return jsonify(status="error", message="The cleaned CSV is not available."), 404
+
+    try:
+        cleaned_csv_path = get_cleaned_csv_path(history_record[1])
+        if not cleaned_csv_path.is_file():
+            return jsonify(status="error", message="The cleaned CSV is not available."), 404
+        safe_filename = secure_filename(history_record[0])
+        download_name = f"{safe_filename.rsplit('.', 1)[0] or 'cleaned'}-cleaned.csv"
+        return send_file(
+            cleaned_csv_path,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=download_name,
+        )
+    except FileNotFoundError:
+        return jsonify(status="error", message="The cleaned CSV is not available."), 404
+    except ValueError:
+        current_app.logger.error("Cleaning history contains an invalid cleaned CSV reference")
+        return jsonify(status="error", message="The cleaned CSV is not available."), 404
+    except OSError:
+        current_app.logger.exception("Could not read persisted cleaned CSV output")
+        return jsonify(
+            status="error",
+            message="The cleaned CSV is temporarily unavailable. Please try again later.",
+        ), 503
+
+
+@api_bp.get("/dashboard-stats")
+@login_required
+def get_dashboard_stats():
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total_cleaning_jobs,
+                       COALESCE(SUM(original_row_count), 0) AS rows_reviewed,
+                       COALESCE(
+                           SUM(GREATEST(
+                               CAST(original_row_count AS SIGNED)
+                               - CAST(final_row_count AS SIGNED),
+                               0
+                           )),
+                           0
+                       ) AS total_rows_removed
+                FROM cleaning_history
+                WHERE user_id = %s
+                """,
+                (g.authenticated_user["id"],),
+            )
+            totals = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT original_filename, original_row_count, final_row_count, created_at
+                FROM cleaning_history
+                WHERE user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 5
+                """,
+                (g.authenticated_user["id"],),
+            )
+            recent_rows = cursor.fetchall()
+    except (pymysql.MySQLError, OSError):
+        current_app.logger.exception("Could not retrieve dashboard statistics")
+        return jsonify(
+            status="error",
+            message="Dashboard statistics are temporarily unavailable. Please try again later.",
+        ), 503
+    finally:
+        if connection is not None:
+            connection.close()
+
+    recent_activity = []
+    for row in recent_rows:
+        created_at = row[3]
+        recent_activity.append({
+            "filename": row[0],
+            "original_row_count": row[1],
+            "final_row_count": row[2],
+            "rows_removed": max(row[1] - row[2], 0),
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+        })
+
+    return jsonify(
+        status="success",
+        statistics={
+            "total_cleaning_jobs": int(totals[0] or 0),
+            "rows_reviewed": int(totals[1] or 0),
+            "total_rows_removed": int(totals[2] or 0),
+            "recent_activity": recent_activity,
+        },
     ), 200
 
 
@@ -472,7 +625,8 @@ def get_cleaning_history():
             cursor.execute(
                 """
                 SELECT id, original_filename, operations,
-                       original_row_count, final_row_count, created_at
+                       original_row_count, final_row_count, created_at,
+                       cleaned_file_id
                 FROM cleaning_history
                 WHERE user_id = %s
                 ORDER BY created_at DESC, id DESC
@@ -510,6 +664,7 @@ def get_cleaning_history():
                 "original_row_count": row[3],
                 "final_row_count": row[4],
                 "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+                "has_cleaned_file": row[6] is not None,
             })
     except (TypeError, ValueError, json.JSONDecodeError):
         current_app.logger.exception("Cleaning history contains invalid stored data")
