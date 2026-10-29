@@ -1,3 +1,4 @@
+import io
 import json
 import hashlib
 import hmac
@@ -16,9 +17,13 @@ from werkzeug.utils import secure_filename
 from config import MAX_UPLOAD_SIZE
 from services.csv_cleaning import (
     MISSING_PLACEHOLDERS,
+    ORIGINAL_ROW_NUMBER_COLUMN,
+    add_new_column,
     clean_dataframe,
     get_data_quality_stats,
     read_csv_for_cleaning,
+    remove_invalid_rows,
+    validate_dataframe,
 )
 from services.database import get_db_connection
 from services.cleaned_file_storage import (
@@ -91,6 +96,17 @@ def require_trusted_origin(view):
         return view(*args, **kwargs)
 
     return wrapped
+
+
+def build_dataset_payload(dataframe):
+    rows = dataframe.copy()
+    row_numbers = list(rows.attrs.get("original_row_numbers", list(range(len(rows)))))
+    display_rows = rows.drop(columns=[ORIGINAL_ROW_NUMBER_COLUMN], errors="ignore")
+    preview = json.loads(display_rows.head(10).to_json(orient="records", date_format="iso"))
+    full_rows = json.loads(display_rows.to_json(orient="records", date_format="iso"))
+    for row_index, row in enumerate(full_rows):
+        row[ORIGINAL_ROW_NUMBER_COLUMN] = int(row_numbers[row_index]) + 2 if row_index < len(row_numbers) else row_index + 2
+    return preview, full_rows
 
 
 @api_bp.get("/health")
@@ -397,7 +413,7 @@ def clean_csv():
     )
     quality_after = get_data_quality_stats(dataframe)
 
-    preview = json.loads(dataframe.head(10).to_json(orient="records", date_format="iso"))
+    preview, full_rows = build_dataset_payload(dataframe)
     cleaned_csv = dataframe.to_csv(index=False)
     operations = []
     if boolean_options["remove_duplicates"]:
@@ -487,8 +503,140 @@ def clean_csv():
             "rows_removed": original_row_count - len(dataframe),
         },
         preview=preview,
+        full_rows=full_rows,
         cleaned_csv=cleaned_csv,
         unfilled_columns=unfilled_columns,
+    ), 200
+
+
+@api_bp.post("/validate-data-types")
+@require_trusted_origin
+@login_required
+def validate_data_types():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(status="error", message="A JSON object is required"), 400
+
+    csv_content = payload.get("csv")
+    expected_types = payload.get("expected_types")
+    if not isinstance(csv_content, str) or not csv_content.strip():
+        return jsonify(status="error", message="A CSV payload is required"), 400
+    if not isinstance(expected_types, dict):
+        return jsonify(status="error", message="Expected types must be provided as a column map"), 400
+
+    try:
+        dataframe = pd.read_csv(io.StringIO(csv_content))
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, UnicodeDecodeError):
+        return jsonify(status="error", message="The CSV payload could not be parsed"), 400
+
+    dataframe.attrs["original_row_numbers"] = list(range(len(dataframe)))
+    report = validate_dataframe(dataframe, expected_types)
+    return jsonify(
+        status="success",
+        validation_report=report,
+        total_invalid_cells=report["total_invalid_cells"],
+        invalid_cells=report["invalid_cells"],
+    ), 200
+
+
+@api_bp.post("/finalize-clean")
+@require_trusted_origin
+@login_required
+def finalize_clean_csv():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(status="error", message="A JSON object is required"), 400
+
+    csv_content = payload.get("csv")
+    if not isinstance(csv_content, str) or not csv_content.strip():
+        return jsonify(status="error", message="A cleaned CSV payload is required"), 400
+
+    operations = payload.get("operations", [])
+    if not isinstance(operations, list) or any(not isinstance(item, str) for item in operations):
+        return jsonify(status="error", message="Cleaning operations must be a list of text values"), 400
+    if not operations:
+        operations = ["Finalize cleaned dataset"]
+
+    filename = payload.get("filename") or "cleaned.csv"
+    original_filename = secure_filename(str(filename)) or "cleaned.csv"
+    if len(original_filename) > 255:
+        return jsonify(status="error", message="The CSV filename is too long"), 400
+
+    try:
+        dataframe = pd.read_csv(io.StringIO(csv_content))
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, UnicodeDecodeError):
+        return jsonify(status="error", message="The final CSV payload could not be parsed"), 400
+
+    final_row_count = len(dataframe)
+    cleaned_file_id = uuid.uuid4().hex
+    try:
+        save_cleaned_csv(cleaned_file_id, csv_content)
+    except OSError:
+        current_app.logger.exception("Could not persist finalized cleaned CSV output")
+        return jsonify(
+            status="error",
+            message="The final CSV could not be saved. Please try again.",
+        ), 503
+
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO cleaning_history (
+                    user_id, original_filename, operations,
+                    original_row_count, final_row_count, cleaned_file_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    g.authenticated_user["id"],
+                    original_filename,
+                    json.dumps(operations),
+                    final_row_count,
+                    final_row_count,
+                    cleaned_file_id,
+                ),
+            )
+            history_id = cursor.lastrowid
+        connection.commit()
+    except (pymysql.MySQLError, OSError) as error:
+        if connection is not None:
+            connection.rollback()
+        try:
+            delete_cleaned_csv(cleaned_file_id)
+        except OSError:
+            current_app.logger.exception("Could not remove unreferenced finalized cleaned CSV output")
+        if isinstance(error, pymysql.MySQLError):
+            error_code = error.args[0] if error.args and isinstance(error.args[0], int) else "unknown"
+            sqlstate = getattr(error, "sqlstate", None) or "unknown"
+            current_app.logger.error(
+                "Could not save finalized CSV history (database error type=%s, code=%s, SQLSTATE=%s)",
+                type(error).__name__,
+                error_code,
+                sqlstate,
+            )
+        else:
+            current_app.logger.error(
+                "Could not save finalized CSV history (error type=%s)",
+                type(error).__name__,
+            )
+        return jsonify(
+            status="error",
+            message="The final CSV could not be saved to history. Please try again.",
+        ), 503
+    finally:
+        if connection is not None:
+            connection.close()
+
+    return jsonify(
+        status="success",
+        history_id=history_id,
+        original_row_count=final_row_count,
+        row_count=final_row_count,
+        operations=operations,
+        cleaned_csv=csv_content,
     ), 200
 
 

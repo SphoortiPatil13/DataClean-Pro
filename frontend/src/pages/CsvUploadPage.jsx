@@ -2,7 +2,65 @@ import { useState } from 'react'
 
 const API_URL = '/api/upload'
 const CLEAN_API_URL = '/api/clean'
+const VALIDATION_API_URL = '/api/validate-data-types'
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024
+const HIDDEN_ROW_NUMBER_KEY = '__data_cleanpro_original_row_number__'
+const DATA_TYPES = ['text', 'integer', 'decimal', 'date']
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) {
+    return ''
+  }
+
+  const text = String(value)
+  if (/[",\n\r]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`
+  }
+  return text
+}
+
+function rowsToCsv(columns, rows) {
+  if (!Array.isArray(columns) || columns.length === 0) {
+    return ''
+  }
+
+  const header = columns.map((column) => escapeCsvValue(column)).join(',')
+  const values = rows.map((row) => columns.map((column) => escapeCsvValue(row?.[column])).join(','))
+  return [header, ...values].join('\n')
+}
+
+function getQualitySnapshot(rows) {
+  const totalRows = rows.length
+  const missingValues = rows.reduce((count, row) => {
+    const values = Object.values(row || {})
+    return count + values.filter((value) => value === null || value === undefined || String(value).trim() === '').length
+  }, 0)
+  const emptyRows = rows.filter((row) => Object.values(row || {}).every((value) => value === null || value === undefined || String(value).trim() === '')).length
+  const duplicateRows = rows.reduce((count, row) => {
+    const index = rows.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(row))
+    return count + (index === rows.indexOf(row) ? 0 : 1)
+  }, 0)
+
+  return {
+    total_rows: totalRows,
+    missing_values: missingValues,
+    duplicate_rows: duplicateRows,
+    empty_rows: emptyRows,
+  }
+}
+
+function getCurrentRows(cleanResult) {
+  if (Array.isArray(cleanResult?.full_rows) && cleanResult.full_rows.length > 0) {
+    return cleanResult.full_rows
+  }
+  if (Array.isArray(cleanResult?.full_rows)) {
+    return cleanResult.full_rows
+  }
+  if (Array.isArray(cleanResult?.preview)) {
+    return cleanResult.preview
+  }
+  return []
+}
 
 function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
   const [file, setFile] = useState(null)
@@ -19,12 +77,53 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isCleaning, setIsCleaning] = useState(false)
+  const [columnName, setColumnName] = useState('')
+  const [columnFillMode, setColumnFillMode] = useState('empty')
+  const [columnDefaultValue, setColumnDefaultValue] = useState('')
+  const [validationTypes, setValidationTypes] = useState({})
+  const [validationReport, setValidationReport] = useState(null)
+  const [validationError, setValidationError] = useState('')
+  const [selectedColumnForRemoval, setSelectedColumnForRemoval] = useState('')
+  const [removalMode, setRemovalMode] = useState('selected')
+
+  function updateValidationMap(columns) {
+    const nextValues = {}
+    columns.forEach((column) => {
+      nextValues[column] = validationTypes[column] || 'text'
+    })
+    setValidationTypes(nextValues)
+  }
+
+  function syncResultRows(nextRows, nextColumns) {
+    setCleanResult((current) => {
+      const base = current || {}
+      const columns = Array.isArray(nextColumns) ? nextColumns : base.columns || []
+      const rows = Array.isArray(nextRows) ? nextRows : []
+      const currentQuality = base.quality_report || { before: { total_rows: 0, missing_values: 0, duplicate_rows: 0, empty_rows: 0 }, after: { total_rows: 0, missing_values: 0, duplicate_rows: 0, empty_rows: 0 }, rows_removed: 0 }
+      const nextQuality = {
+        before: currentQuality.before || { total_rows: 0, missing_values: 0, duplicate_rows: 0, empty_rows: 0 },
+        after: getQualitySnapshot(rows),
+        rows_removed: Math.max((base.original_row_count || rows.length) - rows.length, 0),
+      }
+      return {
+        ...base,
+        columns,
+        row_count: rows.length,
+        preview: rows.slice(0, 10),
+        full_rows: rows,
+        cleaned_csv: rowsToCsv(columns, rows),
+        quality_report: nextQuality,
+      }
+    })
+  }
 
   async function handleSubmit(event) {
     event.preventDefault()
     setError('')
     setResult(null)
     setCleanResult(null)
+    setValidationReport(null)
+    setValidationError('')
 
     if (!file) {
       setError('Choose a CSV file to upload.')
@@ -86,6 +185,8 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
     event.preventDefault()
     setError('')
     setCleanResult(null)
+    setValidationReport(null)
+    setValidationError('')
     if (!file) {
       setError('Choose a CSV file to clean.')
       return
@@ -136,8 +237,118 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
     }
 
     setCleanResult(payload)
+    updateValidationMap(payload.columns || [])
+    setSelectedColumnForRemoval(payload.columns?.[0] || '')
     onCleaningComplete?.()
     setIsCleaning(false)
+  }
+
+  function handleAddColumn(event) {
+    event.preventDefault()
+    setError('')
+    if (!cleanResult) {
+      setError('Upload and clean a CSV before adding a column.')
+      return
+    }
+
+    const trimmedName = columnName.trim()
+    if (!trimmedName) {
+      setError('Enter a column name before adding it.')
+      return
+    }
+
+    const columns = cleanResult.columns || []
+    const duplicate = columns.some((column) => column.trim().toLowerCase() === trimmedName.toLowerCase())
+    if (duplicate) {
+      setError('That column name already exists. Choose a different name.')
+      return
+    }
+
+    const baseRows = getCurrentRows(cleanResult)
+    const nextRows = baseRows.map((row) => ({ ...row, [trimmedName]: columnFillMode === 'default' ? columnDefaultValue : '' }))
+    const nextColumns = [...columns, trimmedName]
+    syncResultRows(nextRows, nextColumns)
+    updateValidationMap(nextColumns)
+    setColumnName('')
+    setColumnDefaultValue('')
+    setColumnFillMode('empty')
+    setValidationReport(null)
+    setValidationError('')
+  }
+
+  async function handleValidateColumns() {
+    setValidationError('')
+    if (!cleanResult?.cleaned_csv) {
+      setValidationError('Clean a CSV before validating data types.')
+      return
+    }
+
+    const expectedTypes = {}
+    cleanResult.columns.forEach((column) => {
+      expectedTypes[column] = validationTypes[column] || 'text'
+    })
+
+    try {
+      const response = await fetch(VALIDATION_API_URL, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv: cleanResult.cleaned_csv, expected_types: expectedTypes }),
+      })
+      const payload = await response.json()
+      if (response.status === 401) {
+        onSessionExpired()
+        return
+      }
+      if (!response.ok || payload?.status !== 'success') {
+        throw new Error(payload?.message || 'Data type validation could not be completed.')
+      }
+      setValidationReport(payload.validation_report)
+      if (!payload.validation_report || payload.validation_report.total_invalid_cells === 0) {
+        setValidationError('No datatype errors were found in the selected columns.')
+      }
+    } catch (error) {
+      setValidationError(error.message || 'Data type validation could not be completed. Please try again.')
+    }
+  }
+
+  function handleKeepRows() {
+    setValidationReport(null)
+    setValidationError('')
+  }
+
+  function handleRemoveRows() {
+    if (!validationReport || validationReport.total_invalid_cells === 0) {
+      setValidationError('No datatype errors were detected, so there are no rows to remove.')
+      return
+    }
+
+    const invalidEntries = validationReport.invalid_cells || []
+    let rowsToRemove = []
+
+    if (removalMode === 'selected') {
+      const targetColumn = selectedColumnForRemoval || validationReport.validated_columns?.[0]
+      rowsToRemove = invalidEntries.filter((entry) => entry.column === targetColumn)
+    } else {
+      rowsToRemove = invalidEntries
+    }
+
+    const rowNumbers = new Set(rowsToRemove.map((entry) => Number(entry.row_number)))
+    const rows = getCurrentRows(cleanResult)
+    const beforeCount = rows.length
+    const nextRows = rows.filter((row) => {
+      const rowNumber = Number(row[HIDDEN_ROW_NUMBER_KEY] ?? (rows.indexOf(row) + 2))
+      return !rowNumbers.has(rowNumber)
+    })
+
+    const confirmationMessage = `${nextRows.length === beforeCount ? 'No rows will be removed' : `Remove ${beforeCount - nextRows.length} row${beforeCount - nextRows.length === 1 ? '' : 's'}?`}`
+    if (!window.confirm(confirmationMessage)) {
+      return
+    }
+
+    syncResultRows(nextRows, cleanResult.columns)
+    setValidationReport(null)
+    setValidationError('')
   }
 
   function downloadCleanedCsv() {
@@ -174,6 +385,8 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
             setFile(event.target.files?.[0] || null)
             setResult(null)
             setCleanResult(null)
+            setValidationReport(null)
+            setValidationError('')
             setError('')
           }}
         />
@@ -344,6 +557,97 @@ function CsvUploadPage({ onSessionExpired, onCleaningComplete }) {
               Could not fill automatically because no suitable value was available for: {cleanResult.unfilled_columns.join(', ')}.
             </p>
           )}
+          <div className="advanced-actions">
+            <h3>Column and validation tools</h3>
+            <form className="column-form" onSubmit={handleAddColumn}>
+              <label>
+                New column name
+                <input type="text" value={columnName} onChange={(event) => setColumnName(event.target.value)} />
+              </label>
+              <label className="column-fill-mode">
+                Fill option
+                <select value={columnFillMode} onChange={(event) => setColumnFillMode(event.target.value)}>
+                  <option value="empty">Create empty column</option>
+                  <option value="default">Use a default value for every row</option>
+                </select>
+              </label>
+              {columnFillMode === 'default' && (
+                <label>
+                  Default value
+                  <input type="text" value={columnDefaultValue} onChange={(event) => setColumnDefaultValue(event.target.value)} />
+                </label>
+              )}
+              <div className="button-row">
+                <button className="button button-primary" type="submit">Add column</button>
+                <button className="button button-secondary" type="button" onClick={() => { setColumnName(''); setColumnDefaultValue(''); setColumnFillMode('empty') }}>Cancel</button>
+              </div>
+            </form>
+            <div className="validation-panel">
+              <h4>Validate data types</h4>
+              {cleanResult.columns.map((column) => (
+                <label className="validation-field" key={column}>
+                  {column}
+                  <select
+                    value={validationTypes[column] || 'text'}
+                    onChange={(event) => setValidationTypes((current) => ({ ...current, [column]: event.target.value }))}
+                  >
+                    {DATA_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+                  </select>
+                </label>
+              ))}
+              <div className="button-row">
+                <button className="button button-primary" type="button" onClick={handleValidateColumns}>Validate selected columns</button>
+              </div>
+            </div>
+            {validationReport && (
+              <div className="validation-report" aria-live="polite">
+                <h4>Validation result</h4>
+                <p className="validation-summary">
+                  <strong>{validationReport.total_invalid_cells}</strong> invalid cells across <strong>{validationReport.distinct_rows_with_errors}</strong> rows.
+                </p>
+                {validationReport.total_invalid_cells === 0 ? (
+                  <p className="example-note">No datatype errors found. The current dataset is valid for the selected rules.</p>
+                ) : (
+                  <>
+                    <ul className="validation-list">
+                      {validationReport.invalid_cells.slice(0, 20).map((entry, index) => (
+                        <li key={`${entry.row_number}-${entry.column}-${index}`}>
+                          <strong>Row {entry.row_number}</strong> · {entry.column} · {entry.expected_type} · {entry.value || 'empty'} · {entry.message}
+                        </li>
+                      ))}
+                    </ul>
+                    {validationReport.invalid_cells.length > 20 && (
+                      <p className="example-note">Showing the first 20 of {validationReport.total_invalid_cells} invalid cells.</p>
+                    )}
+                    <div className="row-removal-panel">
+                      <label className="missing-strategy">
+                        Correction action
+                        <select value={removalMode} onChange={(event) => setRemovalMode(event.target.value)}>
+                          <option value="selected">Remove rows with errors in the selected column</option>
+                          <option value="all">Remove all rows with datatype errors</option>
+                        </select>
+                      </label>
+                      {removalMode === 'selected' && (
+                        <label className="missing-strategy">
+                          Target column
+                          <select value={selectedColumnForRemoval} onChange={(event) => setSelectedColumnForRemoval(event.target.value)}>
+                            {cleanResult.columns.map((column) => (
+                              <option key={column} value={column}>{column}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <div className="button-row">
+                        <button className="button button-danger" type="button" onClick={handleRemoveRows}>Remove rows</button>
+                        <button className="button button-secondary" type="button" onClick={handleKeepRows}>Keep rows unchanged</button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+            {validationError && <p className="register-message register-message-error" role="alert">{validationError}</p>}
+          </div>
           <button className="button button-secondary download-button" type="button" onClick={downloadCleanedCsv}>
             Download cleaned CSV
           </button>

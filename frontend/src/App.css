@@ -1014,6 +1014,83 @@
   accent-color: var(--green);
 }
 
+.button-danger {
+  color: #fff;
+  background: #b24f40;
+  border-color: #b24f40;
+}
+
+.button-danger:hover {
+  background: #8d3d33;
+  border-color: #8d3d33;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.advanced-actions {
+  display: grid;
+  gap: 18px;
+  margin-top: 26px;
+  padding: 22px 20px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #f7faf8;
+}
+
+.advanced-actions h3,
+.validation-panel h4,
+.validation-report h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.column-form,
+.validation-panel,
+.validation-report,
+.row-removal-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.column-form label,
+.validation-field {
+  display: grid;
+  gap: 7px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.column-form input,
+.column-form select,
+.validation-field select,
+.missing-strategy select {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 42px;
+  padding: 8px 10px;
+  border: 1px solid #cfd7d1;
+  border-radius: 5px;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+}
+
+.column-form input:focus-visible,
+.column-form select:focus-visible,
+.validation-field select:focus-visible,
+.missing-strategy select:focus-visible {
+  outline: 3px solid #d2765d;
+  outline-offset: 2px;
+}
+
+.column-fill-mode,
 .missing-strategy {
   display: grid;
   gap: 8px;
@@ -1021,6 +1098,34 @@
   color: var(--ink);
   font-size: 13px;
   font-weight: 600;
+}
+
+.validation-panel {
+  margin-top: 4px;
+}
+
+.validation-field {
+  max-width: 360px;
+}
+
+.validation-summary {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.validation-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.row-removal-panel {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
 }
 
 .missing-strategy select {
